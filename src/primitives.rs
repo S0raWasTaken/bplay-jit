@@ -257,7 +257,7 @@ fn enable_virtual_terminal_processing() {
         let handle = GetStdHandle(STD_OUTPUT_HANDLE);
         if handle != INVALID_HANDLE_VALUE {
             let mut mode = 0;
-            if GetConsoleMode(handle, &mut mode) != 0 {
+            if GetConsoleMode(handle, &raw mut mode) != 0 {
                 if SetConsoleMode(
                     handle,
                     mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
