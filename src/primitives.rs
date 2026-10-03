@@ -1,13 +1,14 @@
 use std::{
-    fs::{read, read_dir},
-    io::{self, Cursor, Write, stdout},
-    path::PathBuf,
+    fs::{File, read, read_dir},
+    io::{self, Cursor, Read, Write, stdout},
+    path::{Path, PathBuf},
     process::exit,
     sync::{Arc, atomic::Ordering},
     thread::{sleep, spawn},
     time::{Duration, Instant},
 };
 
+use crossterm::terminal;
 use rodio::{Decoder, OutputStreamBuilder, Sink, Source};
 
 use crate::{
@@ -18,8 +19,8 @@ use crate::{
 };
 
 pub struct Bapple {
-    frames: Box<[Box<[u8]>]>,
-    audio: Arc<[u8]>, // May be empty
+    frames: Box<[PathBuf]>, // Paths to the extracted frames, read on demand
+    audio: Arc<[u8]>,       // May be empty
     has_audio: bool,
     frametime: Duration,
     counter: usize,
@@ -61,11 +62,8 @@ impl Bapple {
 
         entries.sort_by_key(|e| parse_stem(e.path()).unwrap());
 
-        let frames: Box<[Box<[u8]>]> = entries
-            .into_iter()
-            .filter_map(|e| read(e.path()).ok())
-            .map(Vec::into_boxed_slice)
-            .collect();
+        let frames: Box<[PathBuf]> =
+            entries.into_iter().map(|e| e.path()).collect();
 
         let audio = if has_audio {
             read(tmp_dir.join("audio.mp3"))?
@@ -90,6 +88,11 @@ impl Bapple {
             eprintln!("{FRAMETIME_ZERO}");
             exit(1);
         }
+
+        let first_frame =
+            self.frames.first().ok_or("ffmpeg produced no frames")?;
+        let source_size = png_dimensions(first_frame)?;
+        let mut term_size = terminal::size()?;
 
         #[cfg(target_os = "linux")]
         if self.has_audio {
@@ -137,7 +140,23 @@ impl Bapple {
             }
 
             let task_time = Instant::now();
-            let ascii_frame = make_ascii(&self.frames[self.counter])?;
+
+            // Checked every frame, so the window can be resized while playing.
+            let current_size = terminal::size()?;
+            if current_size != term_size {
+                term_size = current_size;
+                clear(&mut lock)?; // Drop leftovers from the old size
+            }
+            let dimensions =
+                fit_to_terminal(source_size, term_size.0, term_size.1);
+
+            let ascii_frame =
+                match make_ascii(&self.frames[self.counter], dimensions) {
+                    Ok(frame) => frame,
+                    // Ctrl-C deletes the temp dir while we may still be reading
+                    Err(_) if STOP.load(Ordering::Relaxed) => break,
+                    Err(e) => return Err(e),
+                };
 
             return_home(&mut lock)?;
             lock.write_all(ascii_frame.as_bytes())?;
@@ -192,15 +211,47 @@ impl Bapple {
     }
 }
 
-use libasciic::{AsciiBuilder, AsciiError, Style};
-fn make_ascii(raw_frame: &[u8]) -> Result<String, AsciiError> {
-    AsciiBuilder::new(Cursor::new(raw_frame))
+use libasciic::{AsciiBuilder, FilterType, Style};
+fn make_ascii(frame: &Path, (width, height): (u32, u32)) -> Res<String> {
+    Ok(AsciiBuilder::new(File::open(frame)?)
+        .dimensions(width, height)
+        .filter_type(FilterType::Lanczos3)
         .colorize(true)
         .style(Style::Mixed)
         .threshold(5)
         .charset(".:-+=#@")
         .background_brightness(0.6)
-        .make_ascii()
+        .make_ascii()?)
+}
+
+// libasciic resizes to the exact size we give it, so the aspect ratio
+// (and the 1:2 shape of terminal cells) is on us.
+// Fits into cols x rows, never upscales.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn fit_to_terminal(
+    (src_w, src_h): (u32, u32),
+    cols: u16,
+    rows: u16,
+) -> (u32, u32) {
+    let (w, h) = (f64::from(src_w), f64::from(src_h));
+    let scale = (f64::from(cols) / w).min(f64::from(rows) * 2.0 / h).min(1.0);
+
+    (((w * scale) as u32).max(1), ((h * scale / 2.0) as u32).max(1))
+}
+
+// Width and height are stored right after the PNG signature, in the IHDR chunk.
+fn png_dimensions(path: &Path) -> Res<(u32, u32)> {
+    let mut header = [0u8; 24];
+    File::open(path)?.read_exact(&mut header)?;
+
+    if &header[..8] != b"\x89PNG\r\n\x1a\n" {
+        return Err("Extracted frame is not a PNG".into());
+    }
+
+    Ok((
+        u32::from_be_bytes(header[16..20].try_into()?),
+        u32::from_be_bytes(header[20..24].try_into()?),
+    ))
 }
 
 #[cfg(windows)]

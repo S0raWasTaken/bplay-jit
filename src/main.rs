@@ -45,26 +45,15 @@ fn run() -> Res<()> {
     let once = Once::new();
     ctrlc::set_handler(move || once.call_once(ctrl_c))?;
 
-    wait_for_resize();
-
     let video_file = args().nth(1).ok_or("Usage: bplay-jit <video>")?;
 
     let mut bapple = Bapple::new(&video_file)?;
+
+    // Frames are read from the temp dir during playback, so it can only
+    // be deleted once we're done.
+    let result = bapple.play();
     cleanup();
-
-    bapple.play()?;
-    Ok(())
-}
-
-fn wait_for_resize() {
-    println!(
-        "Resize this window however you want, \
-        just be mindful that cmd.exe is a bottleneck."
-    );
-    println!("If you're using it, try not to maximise it :)");
-    println!("-- Press Enter To Continue --");
-
-    let _ = std::io::stdin().read_line(&mut String::new());
+    result
 }
 
 fn err_exit<T>(result: Result<T, impl Debug>) -> T {

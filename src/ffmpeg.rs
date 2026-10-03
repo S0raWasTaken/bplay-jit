@@ -7,8 +7,6 @@ use std::{
     },
 };
 
-use crossterm::terminal;
-
 use crate::{Res, TEMP_DIR, err_exit, installer::Dependencies};
 
 static FFMPEG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
@@ -17,20 +15,12 @@ static FFMPEG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
 });
 
 pub fn split_video_frames(video_path: &str) -> Res<()> {
-    let (cols, rows) = terminal::size()?;
-
-    let filter_v = format!(
-        "scale=w='max(1,trunc(iw*min(1,min({w}/iw,{h}/ih))))':\
-              h='max(1,trunc(ih*min(1,min({w}/iw,{h}/ih))/2))':flags=lanczos,fps=24",
-        w = cols,
-        h = rows * 2,
-    );
-
+    // Frames are extracted at full resolution, libasciic does the resizing.
     ffmpeg(&[
         "-i",
         video_path,
         "-vf",
-        &filter_v,
+        "fps=24",
         &format!("{}/%03d.png", TEMP_DIR.to_string_lossy()),
     ])
 }

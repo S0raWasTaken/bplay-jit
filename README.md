@@ -1,6 +1,11 @@
-# bplay-jit
+# bplay-jit - Direct IO Version
 A fork of [bapple_player](https://github.com/S0raWasTaken/bapple_player) that doesn't need pre-rendered .bapple files.
 It takes any video and turns the frames into ASCII while playing them, and it stays in sync with the audio.
+
+This branch includes the Direct IO version of the player. In this one, frames are stored in the disk throughout the duration of the
+video, and they're resized during playback, making it possible to resize the video while playing.
+
+The only con is that since we're not using ffmpeg to resize, frame splitting takes way longer.
 
 ### Installation
 ```sh
