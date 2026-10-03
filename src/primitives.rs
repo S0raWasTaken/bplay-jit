@@ -1,6 +1,6 @@
 use std::{
     fs::{File, read, read_dir},
-    io::{self, Cursor, Read, Write, stdout},
+    io::{self, Cursor, Write, stdout},
     path::{Path, PathBuf},
     process::exit,
     sync::{Arc, atomic::Ordering},
@@ -91,7 +91,7 @@ impl Bapple {
 
         let first_frame =
             self.frames.first().ok_or("ffmpeg produced no frames")?;
-        let source_size = png_dimensions(first_frame)?;
+        let source_size = jpeg_dimensions(first_frame)?;
         let mut term_size = terminal::size()?;
 
         #[cfg(target_os = "linux")]
@@ -239,19 +239,44 @@ fn fit_to_terminal(
     (((w * scale) as u32).max(1), ((h * scale / 2.0) as u32).max(1))
 }
 
-// Width and height are stored right after the PNG signature, in the IHDR chunk.
-fn png_dimensions(path: &Path) -> Res<(u32, u32)> {
-    let mut header = [0u8; 24];
-    File::open(path)?.read_exact(&mut header)?;
+// Walks the JPEG markers until the start-of-frame one, which holds the size.
+fn jpeg_dimensions(path: &Path) -> Res<(u32, u32)> {
+    let data = read(path)?;
 
-    if &header[..8] != b"\x89PNG\r\n\x1a\n" {
-        return Err("Extracted frame is not a PNG".into());
+    if !data.starts_with(&[0xFF, 0xD8]) {
+        return Err("Extracted frame is not a JPEG".into());
     }
 
-    Ok((
-        u32::from_be_bytes(header[16..20].try_into()?),
-        u32::from_be_bytes(header[20..24].try_into()?),
-    ))
+    let mut i = 2;
+    while i + 4 <= data.len() {
+        if data[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+
+        match data[i + 1] {
+            // Padding, and markers that have no length
+            0x00 | 0x01 | 0xD0..=0xD8 => i += 2,
+            0xFF => i += 1,
+            // End of image / start of scan, no size found before them
+            0xD9 | 0xDA => break,
+            // SOF0-SOF15, minus DHT, JPG and DAC
+            m @ 0xC0..=0xCF if !matches!(m, 0xC4 | 0xC8 | 0xCC) => {
+                if i + 9 > data.len() {
+                    break;
+                }
+                let height = u16::from_be_bytes([data[i + 5], data[i + 6]]);
+                let width = u16::from_be_bytes([data[i + 7], data[i + 8]]);
+                return Ok((width.into(), height.into()));
+            }
+            _ => {
+                let len = u16::from_be_bytes([data[i + 2], data[i + 3]]);
+                i += 2 + usize::from(len);
+            }
+        }
+    }
+
+    Err("Could not find the size of the extracted frame".into())
 }
 
 #[cfg(windows)]

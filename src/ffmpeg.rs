@@ -17,11 +17,15 @@ static FFMPEG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
 pub fn split_video_frames(video_path: &str) -> Res<()> {
     // Frames are extracted at full resolution, libasciic does the resizing.
     ffmpeg(&[
+        "-hwaccel",
+        "auto", // Falls back to software decoding if unavailable
         "-i",
         video_path,
         "-vf",
         "fps=24",
-        &format!("{}/%03d.png", TEMP_DIR.to_string_lossy()),
+        "-q:v",
+        "2", // JPEG quality, 2 is near-lossless and still very fast to encode
+        &format!("{}/%03d.jpg", TEMP_DIR.to_string_lossy()),
     ])
 }
 
