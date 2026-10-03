@@ -1,6 +1,6 @@
 use std::{
-    fs::File,
-    io::{self, Cursor, Read, Write, stdout},
+    fs::{read, read_dir},
+    io::{self, Cursor, Write, stdout},
     path::PathBuf,
     process::exit,
     sync::{Arc, atomic::Ordering},
@@ -8,21 +8,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clap::{Parser, crate_version};
 use rodio::{Decoder, OutputStreamBuilder, Sink, Source};
-use ron::de::from_bytes;
-use serde::Deserialize;
-use tar::{Archive, Entry};
-use zstd::decode_all;
 
 use crate::{
-    Res, STOP,
+    Res, STOP, TEMP_DIR,
     backup_counter::{SYNC_COUNTER, outside_counter},
+    ffmpeg::{extract_audio, split_video_frames},
     messages::FRAMETIME_ZERO,
 };
 
 pub struct Bapple {
-    compressed_frames: Vec<Vec<u8>>,
+    frames: Box<[Box<[u8]>]>,
     audio: Arc<[u8]>, // May be empty
     has_audio: bool,
     frametime: Duration,
@@ -37,34 +33,55 @@ impl Drop for Bapple {
 }
 
 impl Bapple {
-    pub fn new(path: PathBuf) -> Res<Self> {
-        println!("Processing frames...");
+    pub fn new(video_file: &str) -> Res<Self> {
+        let tmp_dir = &*TEMP_DIR;
 
-        let mut audio = Vec::new();
-        let mut has_audio = false;
-        let mut frametime = 0;
+        println!("Extracting frames and audio...");
+        split_video_frames(video_file)?;
 
-        let compressed_frames = Archive::new(File::open(path)?)
-            .entries()?
-            .filter_map(|e| {
-                Self::process_frames(
-                    e,
-                    &mut has_audio,
-                    &mut audio,
-                    &mut frametime,
-                )
-            })
-            .collect::<Vec<_>>();
+        let has_audio = extract_audio(video_file).is_ok();
 
-        let length = compressed_frames.len();
+        let mut entries: Vec<_> = read_dir(tmp_dir)?
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name() != "audio.mp3")
+            .collect();
+
+        let parse_stem = |p: PathBuf| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok())
+        };
+
+        if entries.iter().any(|e| parse_stem(e.path()).is_none()) {
+            return Err(
+                "Somehow, ffmpeg returned a file name that's not a number."
+                    .into(),
+            );
+        }
+
+        entries.sort_by_key(|e| parse_stem(e.path()).unwrap());
+
+        let frames: Box<[Box<[u8]>]> = entries
+            .into_iter()
+            .filter_map(|e| read(e.path()).ok())
+            .map(Vec::into_boxed_slice)
+            .collect();
+
+        let audio = if has_audio {
+            read(tmp_dir.join("audio.mp3"))?
+        } else {
+            Vec::new()
+        };
+
+        let frametime = Duration::from_secs_f64(1.0 / 24.0);
 
         Ok(Self {
-            compressed_frames,
+            length: frames.len(),
+            frames,
             audio: audio.into(),
             has_audio,
-            frametime: Duration::from_micros(frametime),
+            frametime,
             counter: 0,
-            length,
         })
     }
 
@@ -120,11 +137,10 @@ impl Bapple {
             }
 
             let task_time = Instant::now();
-            let decompressed_frame =
-                decode_all(&*self.compressed_frames[self.counter])?;
+            let ascii_frame = make_ascii(&self.frames[self.counter])?;
 
             return_home(&mut lock)?;
-            lock.write_all(&decompressed_frame)?;
+            lock.write_all(ascii_frame.as_bytes())?;
             lock.flush()?;
 
             if !self.counter.is_multiple_of(15) {
@@ -160,11 +176,6 @@ impl Bapple {
             as usize
     }
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    pub fn set_frametime(&mut self, frametime: f64) {
-        self.frametime = Duration::from_micros(frametime as u64);
-    }
-
     pub fn backup_resync(&mut self) {
         self.counter = SYNC_COUNTER.load(Ordering::Relaxed);
     }
@@ -179,69 +190,17 @@ impl Bapple {
             sleep(Duration::from_secs(5));
         }
     }
-
-    fn process_frames(
-        entry: Result<Entry<'_, File>, io::Error>,
-        has_audio: &mut bool,
-        audio: &mut Vec<u8>,
-        outer_frametime: &mut u64,
-    ) -> Option<Vec<u8>> {
-        let mut entry = entry.ok()?;
-        let file_stem = entry.header().path().ok()?.file_stem()?.to_os_string();
-
-        let mut content = Vec::new();
-        entry.read_to_end(&mut content).ok()?;
-
-        if file_stem == *"audio" {
-            *has_audio = true;
-            *audio = content;
-
-            return None;
-        } else if file_stem == *"metadata" {
-            let Metadata { frametime, fps } =
-                from_bytes(&content).unwrap_or_default();
-            if frametime != 0 {
-                *outer_frametime = frametime;
-            } else if fps != 0 {
-                // DEPRECATED
-                *outer_frametime = 1_000_000 / fps;
-            }
-            // No further processing, since this can be
-            // overriden by the FPS arg
-            return None;
-        }
-
-        Some(content)
-    }
 }
 
-/// Asciix on cocaine
-#[derive(Parser, Debug)]
-#[command(version(crate_version!()))]
-pub struct Args {
-    /// Path to a .bapple file.
-    pub file: PathBuf,
-    /// Should be self-explanatory.
-    #[arg(default_value = "0", value_parser = validate_fps)]
-    pub frames_per_second: f64,
-    /// Enables looping
-    #[arg(short, long)]
-    pub r#loop: bool,
-}
-
-fn validate_fps(s: &str) -> std::result::Result<f64, String> {
-    let fps: f64 = s.parse().map_err(|e| format!("{e}"))?;
-    if fps != 0.0 /*Value for autodetect*/ && fps < 0.01 {
-        return Err("FPS value is too small.".to_string());
-    }
-    Ok(fps)
-}
-
-#[derive(Deserialize, Default)]
-pub struct Metadata {
-    frametime: u64,
-    /// DEPRECATED
-    fps: u64,
+use libasciic::{AsciiBuilder, AsciiError, Style};
+fn make_ascii(raw_frame: &[u8]) -> Result<String, AsciiError> {
+    AsciiBuilder::new(Cursor::new(raw_frame))
+        .colorize(true)
+        .style(Style::Mixed)
+        .threshold(5)
+        .charset(".:-+=#@")
+        .background_brightness(0.6)
+        .make_ascii()
 }
 
 #[cfg(windows)]
